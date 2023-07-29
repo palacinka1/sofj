@@ -1,0 +1,156 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/chromedp/chromedp"
+	"github.com/gorilla/websocket"
+)
+
+const (
+	loginURL  = "https://www.alik.cz/prihlasit"
+	tableURL  = "https://www.alik.cz/k/JMENOSTOLU"
+	logoutURL = "https://www.alik.cz/k/JMENOSTOLU/odejit"
+	username  = "JMENO ROBOTA"
+	password  = "HESLO ROBOTA"
+)
+
+var loadedMessages = make(map[string]bool)
+var isConnected = false
+
+const introMsg = ""
+
+func main() {
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
+	if err := login(ctx); err != nil {
+		log.Fatal("Chyba při přihlašování:", err)
+	}
+
+	fmt.Println("ROBOT je úspěšně připojen!")
+
+	isConnected = true
+
+	go watchForNewMessages()
+
+	var input string
+	fmt.Scanln(&input)
+}
+
+func login(ctx context.Context) error {
+	var loginAction = chromedp.Tasks{
+		chromedp.Navigate(loginURL),
+		chromedp.WaitVisible(`#login`),
+		chromedp.SendKeys(`#login`, username),
+		chromedp.SendKeys(`#heslo`, password),
+		chromedp.Click(`.tlacitko`),
+		chromedp.WaitNotPresent(`.tlacitko`),
+	}
+
+	if err := chromedp.Run(ctx, loginAction); err != nil {
+		return err
+	}
+
+	time.Sleep(2 * time.Second)
+
+	var setMsgAction = chromedp.Tasks{
+		chromedp.Navigate(tableURL),
+		chromedp.EvaluateAsDevTools(`document.querySelector('#say').value = 'ZPRAVA';`, nil),
+		chromedp.Click(`#send-text`),
+	}
+
+	return chromedp.Run(ctx, setMsgAction)
+}
+
+func watchForNewMessages() {
+	conn, _, err := websocket.DefaultDialer.Dial("wss://www.alik.cz/ws", nil)
+	if err != nil {
+		log.Fatal("Chyba při připojování k WebSockets:", err)
+	}
+	defer conn.Close()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Println("Chyba při čtení zprávy z WebSockets:", err)
+			return
+		}
+
+		var message struct {
+			Text string `json:"t"`
+		}
+
+		if err := json.Unmarshal(msg, &message); err != nil {
+			log.Println("Chyba při zpracování zprávy z WebSockets:", err)
+			continue
+		}
+
+		handleMessage(message.Text)
+	}
+}
+
+func handleMessage(msg string) {
+	fmt.Println("Nová zpráva:", msg)
+
+	if isConnected && !loadedMessages[msg] {
+		loadedMessages[msg] = true
+
+		if strings.Contains(strings.ToLower(msg), "sofj počasí") {
+			weather, err := getWeatherForCity("Praha")
+			if err != nil {
+				log.Println("Chyba při získávání počasí:", err)
+				return
+			}
+
+			response := fmt.Sprintf("Dnes je v %s %d stupňů celsia.", weather.Lokalita, weather.Teplota)
+			if err := sendResponse(response); err != nil {
+				log.Println("Chyba při odesílání odpovědi:", err)
+			} else {
+				fmt.Println("Odpověď byla úspěšně odeslána:", response)
+			}
+		}
+	}
+}
+
+func sendResponse(response string) error {
+	conn, _, err := websocket.DefaultDialer.Dial("wss://www.alik.cz/ws", nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	payload := fmt.Sprintf(`{"c": 0, "a": "talk", "s": 1, "b": %q}`, response)
+	return conn.WriteMessage(websocket.TextMessage, []byte(payload))
+}
+
+type WeatherData struct {
+	Pocasi   string `json:"pocasi"`
+	Lokalita string `json:"lokalita"`
+	Region   string `json:"region"`
+	Teplota  int    `json:"teplota"`
+}
+
+func getWeatherForCity(city string) (*WeatherData, error) {
+	url := fmt.Sprintf("SEM PŘIDEJ API PRO POČASÍ", city)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var weather WeatherData
+	err = json.NewDecoder(resp.Body).Decode(&weather)
+	if err != nil {
+		return nil, err
+	}
+
+	return &weather, nil
+}
